@@ -1,4 +1,4 @@
-"""
+﻿"""
 Facebook Scraper - Auto version
 Tự động cà dữ liệu từ danh sách fanpage
 """
@@ -16,6 +16,7 @@ import os
 import base64
 import re
 import urllib.parse
+from datetime import datetime, timezone, timedelta
 from html import unescape
 
 try:
@@ -26,6 +27,11 @@ except ImportError:
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..', '..'))
+
+SRC_ROOT = os.path.join(PROJECT_ROOT, 'src')
+for import_path in (PROJECT_ROOT, SRC_ROOT, SCRIPT_DIR):
+    if import_path and import_path not in sys.path:
+        sys.path.insert(0, import_path)
 
 ENV_PATHS = [
     os.path.join(PROJECT_ROOT, '.env'),
@@ -96,17 +102,15 @@ PROXIES = {'http': PROXY, 'https': PROXY} if PROXY else None
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'data', 'raw')
 SAVE_IMAGES = True
 
-# ============= DANH SÁCH FANPAGE CẦN CÀ =============
-# Format: Full URL từ Facebook
-FANPAGES = [
-    {
-        "url": "https://www.facebook.com/SamsungVietnam",
-        "name": "Samsung"
-    },
-    # Thêm fanpage khác ở đây (dạng full URL)
-]
+# ============= DANH Sﾃ，H FANPAGE C蘯ｦN Cﾃ =============
+# Format: Full URL t盻ｫ Facebook
+FANPAGES_FILE = os.path.join(SCRIPT_DIR, 'fanpages.json')
 
-POST_LIMIT_PER_FANPAGE = 3  # Chỉ cà 3 posts per page
+POST_LIMIT_PER_FANPAGE = 5  # Ch盻・cﾃ 3 posts per page
+MIN_COMMENT_COUNT = 50  # Ch盻・l蘯･y bﾃi cﾃｳ trﾃｪn 50 comment.
+COMMENT_SAMPLE_LIMIT = 60  # Ch盻・l蘯･y ﾄ妥ｺng 60 comment ﾄ黛ｺｧu theo m蘯ｷc ﾄ黛ｻ杵h.
+REFERENCE_DATE_UTC = datetime(2026, 4, 21, tzinfo=timezone.utc)
+RECENT_POST_CUTOFF_UTC = REFERENCE_DATE_UTC - timedelta(days=7)
 
 # ========= HELPER FUNCTIONS =========
 def sanitize_fanpage_name(name):
@@ -116,6 +120,139 @@ def sanitize_fanpage_name(name):
     # Loại bỏ các ký tự không hợp lệ, chỉ giữ alphanumeric, space, dash, underscore
     sanitized = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
     return sanitized or "Unknown"
+
+def load_fanpages(file_path=FANPAGES_FILE):
+    if not os.path.exists(file_path):
+        print(f"❌ Không tìm thấy file fanpages: {file_path}")
+        return []
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"❌ Không đọc được fanpages.json: {e}")
+        return []
+
+    if isinstance(data, dict):
+        data = data.get("fanpages", [])
+
+    if not isinstance(data, list):
+        print("❌ fanpages.json phải là mảng object hoặc object có key 'fanpages'.")
+        return []
+
+    fanpages = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        name = str(item.get("name") or "Unknown").strip() or "Unknown"
+        fanpages.append({"url": url, "name": name})
+
+    return fanpages
+
+def _normalize_timestamp(value):
+    if value is None or isinstance(value, bool):
+        return None
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or not text.isdigit():
+            return None
+        timestamp = int(text)
+    elif isinstance(value, (int, float)):
+        timestamp = int(value)
+    else:
+        return None
+
+    # N蘯ｿu lﾃ milliseconds thﾃｬ ﾄ黛ｻ品 v盻・seconds.
+    if timestamp > 10_000_000_000:
+        timestamp = timestamp // 1000
+
+    # Ch盻・nh蘯ｭn m盻祖 th盻拱 gian h盻｣p l盻・trong kho蘯｣ng nﾄノ 2000-2050.
+    if timestamp < 946684800 or timestamp > 2524608000:
+        return None
+
+    return timestamp
+
+def _collect_timestamps_for_keys(data, target_keys, collected):
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if str(key) in target_keys:
+                ts = _normalize_timestamp(value)
+                if ts is not None:
+                    collected.append(ts)
+            _collect_timestamps_for_keys(value, target_keys, collected)
+    elif isinstance(data, list):
+        for item in data:
+            _collect_timestamps_for_keys(item, target_keys, collected)
+
+def _extract_post_timestamp(node):
+    if not isinstance(node, dict):
+        return None
+
+    candidates = []
+
+    direct_candidates = [
+        node.get("creation_time"),
+        node.get("publish_time"),
+        node.get("created_time"),
+        _get_nested_dict(node, ["comet_sections", "content", "story", "creation_time"]),
+        _get_nested_dict(node, ["comet_sections", "content", "story", "publish_time"]),
+        _get_nested_dict(node, ["comet_sections", "context_layout", "story", "creation_time"]),
+        _get_nested_dict(node, ["comet_sections", "context_layout", "story", "publish_time"]),
+    ]
+
+    for value in direct_candidates:
+        ts = _normalize_timestamp(value)
+        if ts is not None:
+            candidates.append(ts)
+
+    metadata_paths = [
+        ["comet_sections", "content", "story", "comet_sections", "metadata"],
+        ["comet_sections", "context_layout", "story", "comet_sections", "metadata"],
+    ]
+
+    for path in metadata_paths:
+        metadata_items = _get_nested_dict(node, path)
+        if not isinstance(metadata_items, list):
+            continue
+
+        for item in metadata_items:
+            if not isinstance(item, dict):
+                continue
+            story_block = item.get("story")
+            if not isinstance(story_block, dict):
+                story_block = {}
+            for key in ("creation_time", "publish_time", "created_time"):
+                ts = _normalize_timestamp(story_block.get(key))
+                if ts is not None:
+                    candidates.append(ts)
+
+    _collect_timestamps_for_keys(
+        node,
+        {"creation_time", "publish_time", "created_time", "publish_timestamp", "creation_timestamp"},
+        candidates,
+    )
+
+    if not candidates:
+        return None
+    return max(candidates)
+
+def _is_recent_post(node):
+    timestamp = _extract_post_timestamp(node)
+    if timestamp is None:
+        return False, None
+
+    post_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    return post_dt >= RECENT_POST_CUTOFF_UTC, post_dt
+
+def _is_textual_comment(text):
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not cleaned:
+        return False
+    return any(ch.isalnum() for ch in cleaned)
 
 # ========= PARSER =========
 def extract_data_blocks(raw_text):
@@ -618,7 +755,6 @@ def fetch_reactions_breakdown(feedback_id, cookies=None):
         return result
 
     try:
-        # Query nhẹ để lấy tổng số người react.
         tooltip_headers = {**BASE_HEADERS, "x-fb-friendly-name": "CometUFIReactionIconTooltipContentQuery"}
         tooltip_data = {
             "av": cookies.get("c_user", "0") if cookies else "0",
@@ -697,7 +833,6 @@ def fetch_reactions_breakdown(feedback_id, cookies=None):
                     continue
                 candidate[bucket] = max(candidate[bucket], _parse_count(item.get("reaction_count")))
 
-            # Ưu tiên node match đúng feedback_id và có likes lớn nhất.
             if not chosen or candidate["likes"] > chosen["likes"]:
                 chosen = candidate
 
@@ -819,242 +954,131 @@ def fetch_comments_from_feedback(feedback_id, cookies=None, max_pages=None):
     """Fetch comments + replies từ feedback_id với nhiều chiến lược để tăng độ phủ."""
     results = []
     seen_comment_ids = set()
-    seen_reply_ids = set()
     seen_text_fallback = set()
     metrics_likes = 0
     metrics_shares = 0
     comment_total = 0
+    scanned_comments = 0
 
     if not feedback_id:
         return results, {"likes": 0, "shares": 0, "comment_total": 0}
 
-    strategies = [
-        {
-            "intent": COMMENTS_INTENT_TOKEN,
-            "location": COMMENTS_FEED_LOCATION,
-            "root_doc": DOC_ID_COMMENTS_ROOT,
-            "root_name": "CommentListComponentsRootQuery",
-            "page_doc": DOC_ID_COMMENTS_PAGINATION,
-            "page_name": "CommentsListComponentsPaginationQuery",
-            "use_root": True,
-        },
-        {
-            "intent": "CHRONOLOGICAL_UNFILTERED_INTENT_V1",
-            "location": "COMET_MEDIA_VIEWER",
-            "root_doc": DOC_ID_COMMENTS_ROOT,
-            "root_name": "CommentListComponentsRootQuery",
-            "page_doc": DOC_ID_COMMENTS_PAGINATION,
-            "page_name": "CommentsListComponentsPaginationQuery",
-            "use_root": True,
-        },
-        {
-            "intent": "REVERSE_CHRONOLOGICAL_UNFILTERED_INTENT_V1",
-            "location": "COMET_MEDIA_VIEWER",
-            "root_doc": DOC_ID_COMMENTS_ROOT,
-            "root_name": "CommentListComponentsRootQuery",
-            "page_doc": DOC_ID_COMMENTS_PAGINATION,
-            "page_name": "CommentsListComponentsPaginationQuery",
-            "use_root": True,
-        },
-        {
-            "intent": "REVERSE_CHRONOLOGICAL_UNFILTERED_INTENT_V1",
-            "location": "DEDICATED_COMMENTING_SURFACE",
-            "root_doc": DOC_ID_COMMENTS_LEGACY,
-            "root_name": "CommentsListComponentsPaginationQuery",
-            "page_doc": DOC_ID_COMMENTS_LEGACY,
-            "page_name": "CommentsListComponentsPaginationQuery",
-            "use_root": False,
-        },
-        {
-            "intent": "RANKED_UNFILTERED_CHRONOLOGICAL_REPLIES_INTENT_V1",
-            "location": "DEDICATED_COMMENTING_SURFACE",
-            "root_doc": DOC_ID_COMMENTS_ROOT,
-            "root_name": "CommentListComponentsRootQuery",
-            "page_doc": DOC_ID_COMMENTS_PAGINATION,
-            "page_name": "CommentsListComponentsPaginationQuery",
-            "use_root": True,
-        },
-        {
-            "intent": "RANKED_UNFILTERED_CHRONOLOGICAL_REPLIES_INTENT_V1",
-            "location": "PERMALINK",
-            "root_doc": DOC_ID_COMMENTS_ROOT,
-            "root_name": "CommentListComponentsRootQuery",
-            "page_doc": DOC_ID_COMMENTS_PAGINATION,
-            "page_name": "CommentsListComponentsPaginationQuery",
-            "use_root": True,
-        },
-    ]
+    cursor = None
+    page = 0
 
-    for strategy in strategies:
-        cursor = None
-        page = 0
-
-        while True:
-            if max_pages is not None and page >= max_pages:
-                break
-            if page >= 220:
-                break
-
-            try:
-                common_vars = {
-                    "commentsIntentToken": strategy["intent"],
-                    "feedLocation": strategy["location"],
-                    "focusCommentID": None,
-                    "id": feedback_id,
-                    "scale": 2,
-                    "useDefaultActor": False,
-                }
-
-                if page == 0 and strategy["use_root"]:
-                    variables = {
-                        **common_vars,
-                        "feedbackSource": 65,
-                    }
-                    blocks = _request_comments_blocks(
-                        strategy["root_doc"],
-                        strategy["root_name"],
-                        variables,
-                        cookies,
-                    )
-                else:
-                    variables = {
-                        **common_vars,
-                        "commentsAfterCount": -1,
-                        "commentsAfterCursor": cursor,
-                        "commentsBeforeCount": None,
-                        "commentsBeforeCursor": None,
-                    }
-                    blocks = _request_comments_blocks(
-                        strategy["page_doc"],
-                        strategy["page_name"],
-                        variables,
-                        cookies,
-                    )
-
-                if not blocks:
-                    break
-
-                page_has_edges = False
-                has_next = False
-                next_cursor = None
-
-                for block in blocks:
-                    root = block.get("data") if isinstance(block, dict) and isinstance(block.get("data"), dict) else block
-                    if not isinstance(root, dict):
-                        continue
-
-                    extra_likes, extra_shares = _extract_likes_shares_from_payload(root)
-                    metrics_likes = max(metrics_likes, extra_likes)
-                    metrics_shares = max(metrics_shares, extra_shares)
-
-                    comments_block = _extract_comments_block(root)
-                    if not isinstance(comments_block, dict):
-                        continue
-
-                    comment_total = max(comment_total, _parse_count(comments_block.get("total_count")))
-
-                    edges = comments_block.get("edges") or []
-                    if edges:
-                        page_has_edges = True
-
-                    for e in edges:
-                        n = (e or {}).get("node") or {}
-                        comment_id = str(n.get("legacy_fbid") or n.get("id") or "")
-                        text = (n.get("body") or {}).get("text", "")
-                        clean_text = re.sub(r"\s+", " ", (text or "")).strip()
-                        if not clean_text:
-                            clean_text = f"[non-text-comment:{comment_id or 'unknown'}]"
-
-                        can_store_comment = False
-                        if comment_id:
-                            if comment_id not in seen_comment_ids:
-                                seen_comment_ids.add(comment_id)
-                                can_store_comment = True
-                        elif clean_text and clean_text not in seen_text_fallback:
-                            seen_text_fallback.add(clean_text)
-                            can_store_comment = True
-
-                        if can_store_comment:
-                            results.append(clean_text)
-
-                        fb = n.get("feedback")
-                        if not isinstance(fb, dict):
-                            fb = {}
-
-                        replies_connection = fb.get("replies_connection")
-                        if not isinstance(replies_connection, dict):
-                            replies_connection = {}
-
-                        for re_edge in replies_connection.get("edges") or []:
-                            reply_node = (re_edge or {}).get("node") or {}
-                            reply_id = str(reply_node.get("legacy_fbid") or reply_node.get("id") or "")
-                            reply_text = re.sub(r"\s+", " ", ((reply_node.get("body") or {}).get("text") or "")).strip()
-                            if not reply_text:
-                                reply_text = f"[non-text-reply:{reply_id or 'unknown'}]"
-                            if reply_id and reply_id in seen_reply_ids:
-                                continue
-                            if reply_id:
-                                seen_reply_ids.add(reply_id)
-                            elif reply_text in seen_text_fallback:
-                                continue
-                            else:
-                                seen_text_fallback.add(reply_text)
-                            results.append(reply_text)
-
-                        page_info_reply = replies_connection.get("page_info") or {}
-                        reply_total = _parse_count(_get_nested_dict(fb, ["replies_fields", "total_count"]))
-                        visible_reply_count = len(replies_connection.get("edges") or [])
-                        reply_token = _get_nested_dict(fb, ["expansion_info", "expansion_token"]) or page_info_reply.get("end_cursor")
-                        need_more_reply = bool(reply_token) and (
-                            bool(page_info_reply.get("has_next_page"))
-                            or reply_total > visible_reply_count
-                        )
-
-                        if need_more_reply:
-                            reply_items = fetch_replies_for_comment(fb.get("id"), reply_token, cookies)
-                            for reply in reply_items:
-                                reply_id = str(reply.get("id") or "")
-                                reply_text = re.sub(r"\s+", " ", (reply.get("text") or "")).strip()
-                                if not reply_text:
-                                    reply_text = f"[non-text-reply:{reply_id or 'unknown'}]"
-                                if reply_id and reply_id in seen_reply_ids:
-                                    continue
-                                if reply_id:
-                                    seen_reply_ids.add(reply_id)
-                                elif reply_text in seen_text_fallback:
-                                    continue
-                                else:
-                                    seen_text_fallback.add(reply_text)
-                                results.append(reply_text)
-
-                    page_info = comments_block.get("page_info") or {}
-                    has_next = has_next or bool(page_info.get("has_next_page"))
-                    if page_info.get("end_cursor"):
-                        next_cursor = page_info.get("end_cursor")
-
-                if not page_has_edges:
-                    break
-                if not has_next or not next_cursor or next_cursor == cursor:
-                    break
-
-                cursor = next_cursor
-                page += 1
-                time.sleep(0.25)
-
-                if comment_total > 0 and len(seen_comment_ids) >= comment_total:
-                    break
-            except Exception as e:
-                print(f"    ⚠️ Lỗi fetch comments: {e}")
-                break
-
-        if comment_total > 0 and len(seen_comment_ids) >= comment_total:
+    while scanned_comments < COMMENT_SAMPLE_LIMIT:
+        if max_pages is not None and page >= max_pages:
+            break
+        if page >= 120:
             break
 
-    # Bù các comment không thể truy xuất body (privacy/filter) để giữ đủ tổng lượng.
-    if comment_total > 0 and len(results) < comment_total:
-        missing = comment_total - len(results)
-        for idx in range(missing):
-            results.append(f"[missing-comment:{idx + 1}]")
+        try:
+            common_vars = {
+                "commentsIntentToken": COMMENTS_INTENT_TOKEN,
+                "feedLocation": COMMENTS_FEED_LOCATION,
+                "focusCommentID": None,
+                "id": feedback_id,
+                "scale": 2,
+                "useDefaultActor": False,
+            }
+
+            if page == 0:
+                variables = {
+                    **common_vars,
+                    "feedbackSource": 65,
+                }
+                blocks = _request_comments_blocks(
+                    DOC_ID_COMMENTS_ROOT,
+                    "CommentListComponentsRootQuery",
+                    variables,
+                    cookies,
+                )
+            else:
+                variables = {
+                    **common_vars,
+                    "commentsAfterCount": -1,
+                    "commentsAfterCursor": cursor,
+                    "commentsBeforeCount": None,
+                    "commentsBeforeCursor": None,
+                }
+                blocks = _request_comments_blocks(
+                    DOC_ID_COMMENTS_PAGINATION,
+                    "CommentsListComponentsPaginationQuery",
+                    variables,
+                    cookies,
+                )
+
+            if not blocks:
+                break
+
+            page_has_edges = False
+            has_next = False
+            next_cursor = None
+
+            for block in blocks:
+                root = block.get("data") if isinstance(block, dict) and isinstance(block.get("data"), dict) else block
+                if not isinstance(root, dict):
+                    continue
+
+                extra_likes, extra_shares = _extract_likes_shares_from_payload(root)
+                metrics_likes = max(metrics_likes, extra_likes)
+                metrics_shares = max(metrics_shares, extra_shares)
+
+                comments_block = _extract_comments_block(root)
+                if not isinstance(comments_block, dict):
+                    continue
+
+                comment_total = max(comment_total, _parse_count(comments_block.get("total_count")))
+
+                edges = comments_block.get("edges") or []
+                if edges:
+                    page_has_edges = True
+
+                for edge in edges:
+                    node = (edge or {}).get("node") or {}
+                    comment_id = str(node.get("legacy_fbid") or node.get("id") or "")
+                    text = (node.get("body") or {}).get("text", "")
+                    clean_text = re.sub(r"\s+", " ", (text or "")).strip()
+
+                    if comment_id:
+                        if comment_id in seen_comment_ids:
+                            continue
+                        seen_comment_ids.add(comment_id)
+                    else:
+                        if not clean_text or clean_text in seen_text_fallback:
+                            continue
+                        seen_text_fallback.add(clean_text)
+
+                    scanned_comments += 1
+                    if _is_textual_comment(clean_text):
+                        results.append(clean_text)
+
+                    if scanned_comments >= COMMENT_SAMPLE_LIMIT:
+                        break
+
+                page_info = comments_block.get("page_info") or {}
+                has_next = has_next or bool(page_info.get("has_next_page"))
+                if page_info.get("end_cursor"):
+                    next_cursor = page_info.get("end_cursor")
+
+                if scanned_comments >= COMMENT_SAMPLE_LIMIT:
+                    break
+
+            if not page_has_edges:
+                break
+            if scanned_comments >= COMMENT_SAMPLE_LIMIT:
+                break
+            if not has_next or not next_cursor or next_cursor == cursor:
+                break
+
+            cursor = next_cursor
+            page += 1
+            time.sleep(0.2)
+        except Exception as e:
+            print(f"    笞・・L盻擁 fetch comments: {e}")
+            break
+
+    comment_total = max(comment_total, scanned_comments)
 
     return results, {
         "likes": _sanitize_metric(metrics_likes),
@@ -1321,6 +1345,16 @@ def fetch_posts(user_id, page_name, limit=3, page_url=None):
             post_id = node.get("post_id")
             if not post_id:
                 continue
+
+            is_recent, post_dt = _is_recent_post(node)
+            if is_recent:
+                post_date_text = post_dt.strftime('%Y-%m-%d') if post_dt else "unknown"
+                print(
+                    f"      竊ｷ Skip post {post_id}: m盻嬖 hﾆ｡n m盻祖 "
+                    f"{RECENT_POST_CUTOFF_UTC.strftime('%Y-%m-%d')} "
+                    f"({post_date_text})"
+                )
+                continue
             
             temp_page_name = extract_page_name(node) or page_name
             
@@ -1336,13 +1370,6 @@ def fetch_posts(user_id, page_name, limit=3, page_url=None):
                 continue
 
             reaction_metrics = fetch_reactions_breakdown(feedback_id, COOKIES)
-
-            # CHỈ LẤY POSTS CÓ ẢNH
-            fanpage_name_clean = sanitize_fanpage_name(temp_page_name)
-            post_dir = os.path.join(OUTPUT_DIR, "facebook", fanpage_name_clean, str(post_id))
-            media = extract_media(node, post_id, post_dir)
-            if not media:
-                continue
             
             message = (
                 node.get("comet_sections", {})
@@ -1376,6 +1403,17 @@ def fetch_posts(user_id, page_name, limit=3, page_url=None):
                 int((feedback_metrics or {}).get("comment_total", 0) or 0),
                 int(fallback_comment_total or 0),
             )
+
+            if comment_total <= MIN_COMMENT_COUNT:
+                print(f"      竊ｷ Skip post {post_id}: comment_count={comment_total} (<= {MIN_COMMENT_COUNT})")
+                continue
+
+            # CH盻・L蘯､Y POSTS Cﾃ・蘯｢NH
+            fanpage_name_clean = sanitize_fanpage_name(temp_page_name)
+            post_dir = os.path.join(OUTPUT_DIR, "facebook", fanpage_name_clean, str(post_id))
+            media = extract_media(node, post_id, post_dir)
+            if not media:
+                continue
             
             post = {
                 "post_id": post_id,
@@ -1435,52 +1473,45 @@ def main():
     print("\n" + "="*60)
     print("   📘 FACEBOOK AUTO SCRAPER")
     print("="*60 + "\n")
-    
+
     if not COOKIES or 'c_user' not in COOKIES:
         print("❌ LỖI: Chưa có cookies trong .env!")
-        print("\n📋 HƯỚNG DẪN CẬP NHẬT CREDENTIALS:")
-        print("════════════════════════════════════════════")
-        print("1. ⏰ Lưu ý: Cookies hết hạn sau vài ngày - cần lấy LẠI")
-        print("2. 🔓 Mở Facebook trong Chrome")
-        print("3. 🔧 Nhấn F12 → Application tab")
-        print("4. 🗂️ Left panel → Cookies → facebook.com")
-        print("5. 📋 Copy: c_user, xs, datr → cập nhật .env")
-        print("6. 🌐 Network tab → Refresh →Find 'graphql' request")
-        print("7. 📦 Payload tab → Copy fb_dtsg value")
-        print("8. 💾 Paste vào FB_DTSG trong .env")
-        print("════════════════════════════════════════════")
         return
-    
+
     if not FB_DTSG:
         print("⚠️ CẢNH BÁO: Chưa có FB_DTSG trong .env!")
         print("Scraper có thể không hoạt động.")
-    
+
     print(f"✅ User: {COOKIES.get('c_user')}")
     print(f"✅ DOC_ID: {DOC_ID_POSTS[:20]}...")
     print(f"✅ Credentials ready!\n")
-    
+
+    fanpages = load_fanpages()
+    if not fanpages:
+        print("❌ Danh sách fanpage rỗng. Hãy cập nhật file fanpages.json.")
+        return
+
     total_posts = 0
-    
-    for fanpage in FANPAGES:
+
+    for fanpage in fanpages:
         fanpage_url = fanpage.get("url")
         name = fanpage.get("name", "Unknown")
-        
+
         print(f"\n📍 Xử lý: {name}")
         print(f"   URL: {fanpage_url}")
-        
-        # Extract user ID from URL
+
         try:
             user_id = extract_user_id_from_url(fanpage_url)
         except Exception as ex:
             print(f"   ❌ Exception in extract: {ex}")
             user_id = None
-        
+
         if not user_id:
-            print(f"   ❌ Không thể trích xuất ID từ URL, bỏ qua\n")
+            print("   ❌ Không thể trích xuất ID từ URL, bỏ qua\n")
             continue
-        
+
         print(f"   ID: {user_id}")
-        
+
         try:
             posts = fetch_posts(user_id, name, limit=POST_LIMIT_PER_FANPAGE, page_url=fanpage_url)
             print(f"   ✅ Lấy được {len(posts)} posts\n")
@@ -1489,36 +1520,35 @@ def main():
             print(f"   ❌ Lỗi: {e}\n")
             import traceback
             traceback.print_exc()
-        
-        time.sleep(2)  # Delay giữa các fanpage
-    
+
+        time.sleep(2)
+
     print("\n" + "="*60)
     print(f"✅ HOÀN THÀNH! Tổng {total_posts} posts")
     print(f"📂 Dữ liệu lưu tại: {OUTPUT_DIR}/")
     print("="*60 + "\n")
-    
-    # ========= TRÍCH XUẤT DỮ LIỆU & XUẤT CSV =========
+
     if run_data_extraction and total_posts > 0:
         print("\n" + "="*60)
         print("   🔄 NÂNG CẤP: Trích xuất dữ liệu & Xuất CSV")
         print("="*60)
-        
+
         try:
             csv_path, record_count = run_data_extraction(
                 output_dir=OUTPUT_DIR,
                 rename_images=True
             )
-            
+
             if csv_path:
                 print(f"\n🎉 CSV EXPORT THÀNH CÔNG!")
                 print(f"   📊 File: {csv_path}")
                 print(f"   📈 Records: {record_count} dòng")
-        
+
         except Exception as e:
             print(f"\n⚠️ Lỗi trong quá trình export: {e}")
             import traceback
             traceback.print_exc()
-    
+
     print("\n" + "="*60)
 
 if __name__ == "__main__":
@@ -1526,3 +1556,4 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\n⏹️ Dừng chương trình theo yêu cầu người dùng.")
+

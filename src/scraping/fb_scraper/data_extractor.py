@@ -6,6 +6,7 @@ Trích xuất dữ liệu (likes, shares, comments) từ posts và tạo file CS
 import os
 import json
 import csv
+import re
 
 
 class FacebookDataExtractor:
@@ -18,6 +19,51 @@ class FacebookDataExtractor:
         self.image_counter = 0
         self.data_records = []
         self.img_id_mapping = {}  # Map từ image path cũ sang img_id mới
+        self.img_id_pattern = re.compile(r"^fac_(\d+)$", re.IGNORECASE)
+        self.processed_image_pattern = re.compile(r"^fac_\d+\.[A-Za-z0-9]+$", re.IGNORECASE)
+        self._bootstrap_existing_state()
+
+    def _bootstrap_existing_state(self):
+        """Đọc dữ liệu hiện có để tiếp tục img_id thay vì reset từ fac_001."""
+        max_idx = 0
+
+        csv_path = os.path.join(self.output_dir, "facebook", "raw_fb_data.csv")
+        if os.path.exists(csv_path):
+            try:
+                with open(csv_path, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        idx = self._parse_img_id_number((row or {}).get("img_id", ""))
+                        if idx > max_idx:
+                            max_idx = idx
+            except Exception as e:
+                print(f"⚠️ Không thể đọc CSV hiện có để khởi tạo img_id: {e}")
+
+        facebook_dir = os.path.join(self.output_dir, "facebook")
+        if os.path.exists(facebook_dir):
+            for root, _, files in os.walk(facebook_dir):
+                for filename in files:
+                    name_no_ext, _ = os.path.splitext(filename)
+                    idx = self._parse_img_id_number(name_no_ext)
+                    if idx > max_idx:
+                        max_idx = idx
+
+        self.image_counter = max_idx
+
+    def _parse_img_id_number(self, value):
+        text = str(value or "").strip()
+        m = self.img_id_pattern.match(text)
+        if not m:
+            return 0
+        try:
+            return int(m.group(1))
+        except Exception:
+            return 0
+
+    def _is_text_comment(self, value):
+        """Giữ lại comment có ít nhất 1 ký tự chữ hoặc số (loại icon-only)."""
+        text = str(value or "").strip()
+        return any(ch.isalnum() for ch in text)
     
     def get_next_img_id(self):
         """Tạo mã định danh ảnh tiếp theo: fac_001, fac_002, ..."""
@@ -31,7 +77,7 @@ class FacebookDataExtractor:
             for item in comments:
                 if isinstance(item, str):
                     value = item.strip()
-                    if value:
+                    if value and self._is_text_comment(value):
                         texts.append(value)
                 elif isinstance(item, dict):
                     value = (
@@ -42,7 +88,7 @@ class FacebookDataExtractor:
                         or ""
                     )
                     value = str(value).strip()
-                    if value:
+                    if value and self._is_text_comment(value):
                         texts.append(value)
 
         return " | ".join(texts)
@@ -113,14 +159,7 @@ class FacebookDataExtractor:
             # Combine comments thành chuỗi
             comments_data = post_data.get("comments", [])
             comments_text = self._extract_comments_text(comments_data)
-            if isinstance(comments_data, list):
-                comment_count = len([c for c in comments_data if str(c).strip()])
-            else:
-                comment_count = int(post_data.get("comment_count", 0) or 0)
-            
-            # BỎ QUA posts không có comments
-            if not comments_text or not comments_text.strip():
-                return 0
+            comment_count = int(post_data.get("comment_count", 0) or 0)
 
             media_urls = []
             for m in post_data.get("media", []):
@@ -144,6 +183,10 @@ class FacebookDataExtractor:
             # Xử lý từng ảnh
             image_count = 0
             for idx, image_file in enumerate(image_files):
+                # Ảnh đã đặt tên fac_xxx.* được xem là đã xử lý trước đó.
+                if self.processed_image_pattern.match(image_file):
+                    continue
+
                 image_path = os.path.join(post_folder, image_file)
                 img_id = self.get_next_img_id()
                 image_url = media_urls[idx] if idx < len(media_urls) else ""
@@ -218,20 +261,25 @@ class FacebookDataExtractor:
         
         csv_path = os.path.join(facebook_dir, csv_filename)
         
-        print(f"📝 Xuất CSV: {os.path.basename(csv_path)}")
+        print(f"📝 Cập nhật CSV: {os.path.basename(csv_path)}")
         
         try:
-            with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-                fieldnames = ['img_id', 'source', 'fanpage', 'url', 'total_react', 'share_count', 
-                             'react_like', 'react_love', 'react_care', 'react_wow', 'react_angry',
-                             'comment_count', 'raw_comment']
+            fieldnames = ['img_id', 'source', 'fanpage', 'url', 'total_react', 'share_count', 
+                         'react_like', 'react_love', 'react_care', 'react_wow', 'react_angry',
+                         'comment_count', 'raw_comment']
+
+            write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+            mode = 'a' if os.path.exists(csv_path) else 'w'
+
+            with open(csv_path, mode, newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
+                if write_header:
+                    writer.writeheader()
                 
                 for record in self.data_records:
                     writer.writerow(record)
             
-            print(f"✅ Xuất thành công: {len(self.data_records)} dòng\n")
+            print(f"✅ Đã thêm: {len(self.data_records)} dòng\n")
             return csv_path
         
         except Exception as e:
