@@ -13,12 +13,12 @@
 ## 📂 CẤU TRÚC THƯ MỤC DỰ ÁN (PROJECT STRUCTURE)
 ```markdown
 Aesthetic-Pressure-ML/
-├── data/                       # Chứa toàn bộ dữ liệu (Không push ảnh lên Git nếu quá nặng)
+├── data/                       # Chứa toàn bộ dữ liệu (KHÔNG PUSH ảnh lên Git do quá nặng)
 │   ├── raw/                    # Dữ liệu thô vừa cào về
-│   │   ├── fb_ads/             # Ảnh & Review từ Facebook Ads (Vân Anh)
-│   │   ├── shopee_lazada/      # Ảnh & Review từ TMĐT (Linh Khánh)
-│   │   └── social_media/       # Ảnh từ Insta/Pinterest (Hà Ngọc)
-│   ├── processed/              # Dữ liệu sau khi xử lý
+│   │   ├── facebook/           # Chứa các folder của từng shop (gồm file json và ảnh đã tải về) + 1 file csv tổng hợp dữ liệu raw từ Facebook Ads (Vân Anh)
+│   │   ├── shopee/             # Chứa các folder của từng shop (gồm file json và ảnh đã tải về) + 1 file csv tổng hợp dữ liệu raw từ Shopee (Linh Khánh)
+│   │   └── instagram/          # Chứa các folder của từng shop (gồm file json và ảnh đã tải về) + 1 file csv tổng hợp dữ liệu raw từ Pinterest (Hà Ngọc)
+│   ├── processed/              # Dữ liệu SAU KHI XỬ LÝ (Giai đoạn 2)
 │   │   ├── features_cv.csv     # Chỉ số toán học từ GĐ 2 (Shared)
 │   │   ├── labels_nlp.csv      # Nhãn áp lực từ GĐ 3 (Shared)
 │   │   └── final_dataset.csv   # Dataset cuối cùng dùng cho ML (Hà Ngọc merge)
@@ -28,9 +28,9 @@ Aesthetic-Pressure-ML/
 │   └── 03_model_training.ipynb
 ├── src/                        # Mã nguồn chính của dự án (Python scripts)
 │   ├── scraping/               # Module cào dữ liệu (GĐ 1)
-│   │   ├── fb_scraper.py       # (Vân Anh)
-│   │   ├── ecom_scraper.py     # (Linh Khánh)
-│   │   └── social_scraper.py   # (Hà Ngọc)
+│   │   ├── fb_scraper/         # (Vân Anh)
+│   │   ├── shopee_scraper/     # (Linh Khánh)
+│   │   └── ins_scraper/        # (Hà Ngọc)
 │   ├── features/               # Module xử lý ảnh OpenCV (GĐ 2)
 │   │   ├── edge_processor.py   # (Vân Anh)
 │   │   ├── color_processor.py  # (Linh Khánh)
@@ -57,12 +57,12 @@ Aesthetic-Pressure-ML/
 ## 👥 Team Members
 * **Lê Vân Anh (Leader):** Chịu trách nhiệm Logic tổng, CV (Cạnh), Scraping FB và Model RF.
 * **Linh Khánh:** Chịu trách nhiệm NLP Sentiment, CV (Màu sắc), Scraping TMĐT và Model SVM/KNN.
-* **Hà Ngọc:** Chịu trách nhiệm Merging Data, CV (Chữ/Khoảng trắng), Scraping Social và Code Demo.
+* **Hà Ngọc:** Chịu trách nhiệm CV (Chữ/Khoảng trắng), Scraping Social và Demo.
 
 ## 🚀 Quy trình làm việc trên Git (Workflow)
 Để tránh xung đột code, team thống nhất:
-1. **Branching:** Không push trực tiếp lên `main`. Mỗi người làm trên branch riêng: `dev-vananh`, `dev-khanh`, `dev-ngoc`.
-2. **Merging:** Sau khi hoàn thành một module, thực hiện **Pull Request (PR)** để Leader duyệt trước khi merge vào `main`.
+1. **Branching:** Không push trực tiếp lên `main`. Mỗi người làm trên branch riêng: `vanh`, `linhkhanh`, `hangoc`.
+2. **Merging:** Sau khi hoàn thành một module, thông báo để Vanh duyệt trước khi merge vào `main`.
 3. **Commit Message:** Ghi rõ nội dung: `feat: add edge detection`, `fix: bug in nlp script`.
 
 ## 🛠 Hướng dẫn cài đặt
@@ -86,4 +86,5 @@ link notion quản lý dự án: [AESTHETIC PRESSURE](https://www.notion.so/AEST
 
 ### 💡 Lưu ý:
 1. **File `requirements.txt`:** Mỗi khi ai đó cài thêm thư viện mới (ví dụ: `EasyOCR` hay `Underthesea`), hãy cập nhật vào file này để 2 bạn còn lại chỉ cần chạy lệnh `pip install` là có môi trường giống hệt nhau.
-2. **Notion Sync:** Mỗi khi Merge code thành công trên Git, hãy chuyển trạng thái Task trên Notion sang **Done**.
+2. **Notion Sync:** Khi đã xong code và push lên branch của mình, Task trên Notion = "Duyệt" và thông báo cho Vanh. Khi Vanh đã Merge code trên Git, Task trên Notion = **Done**.
+3. **Git:** Để tránh git conflict thì tất cả đều phải pull code từ main trước khi LÀM Task tiếp theo/ push code lên branch của mình.
