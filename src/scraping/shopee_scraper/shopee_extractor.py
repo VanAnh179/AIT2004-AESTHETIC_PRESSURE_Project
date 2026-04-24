@@ -10,7 +10,8 @@ from selenium.common.exceptions import NoSuchElementException
 
 # ── Cấu hình ──────────────────────────────────────────────────────────────────
 MAX_PRODUCTS      = 20   # tối đa SP mỗi banner
-MIN_COMMENTS      = 2    # SP phải có >= 2 comment hợp lệ
+MIN_COMMENTS      = 2    # giữ lại để thu raw_comment
+MIN_REVIEWS       = 2    # SP có >= 2 review hợp lệ sẽ được tính là đạt
 MAX_COMMENTS_EACH = 5    # chỉ lấy 5 comment/SP cho raw_comment
 MAX_PAGES_PER_SP  = 3    # tối đa 3 trang review mỗi SP
 
@@ -21,6 +22,8 @@ KNOWN_REVIEW_SELECTORS = [
     'div.shopee-product-rating',
     '[class*="product-ratings__list"] > div',
     '[class*="product-rating__main"]',
+    '[data-cmtid]',
+    '[class*="rating"]',
 ]
 COMMENT_SELECTORS = [
     'div.YNedDV', '[class*="YNedDV"]',
@@ -28,7 +31,7 @@ COMMENT_SELECTORS = [
     '[class*="review-content"]', '[class*="comment-content"]',
 ]
 
-DATE_RE = re.compile(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}')
+DATE_RE = re.compile(r'\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?')
 
 SELLER_REPLY_RE = re.compile(
     r'phản\s*hồi\s*của\s*người\s*bán|seller\s*reply|shop\s*reply', re.I
@@ -77,6 +80,45 @@ def post_clean(t: str) -> str:
     t = re.sub(r'\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}', ' ', t)
     t = normalize_space(t)
     return t if len(t) >= 2 else ''
+
+
+def normalize_product_url(href: str) -> str:
+    href = (href or '').strip()
+    if not href:
+        return ''
+    if href.startswith('//'):
+        href = 'https:' + href
+    elif href.startswith('/'):
+        href = 'https://shopee.vn' + href
+    elif not href.startswith('http'):
+        return ''
+    href = href.split('?')[0]
+    return href if ('/product/' in href or re.search(r'-i\.\d+\.\d+', href)) else ''
+
+
+def parse_review_date(date_str: str):
+    if not date_str:
+        return None
+    from datetime import datetime
+    for fmt in ('%Y-%m-%d %H:%M', '%Y-%m-%d'):
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def wait_if_verification_page(driver):
+    """Nếu Shopee bật captcha/xác thực thì chờ user xử lý tay."""
+    try:
+        url = (driver.current_url or '').lower()
+    except Exception:
+        return
+    if any(k in url for k in ('verify', 'captcha', 'anti-bot', 'bot-check')):
+        print()
+        print('🚧  Shopee đang yêu cầu xác thực / captcha.')
+        print('   Hãy xử lý trên Chrome rồi quay lại đây.')
+        input('>>> Nhấn Enter để tiếp tục scraping: ')
 
 
 # ── Star extraction ────────────────────────────────────────────────────────────
@@ -177,12 +219,15 @@ def is_review_card(el) -> bool:
     if not text:
         return False
     date_hits = DATE_RE.findall(text)
-    if len(date_hits) != 1:
+    if len(date_hits) > 2:
         return False
-    if len(text) > 3000:
+    if len(text) > 5000:
         return False
     classes    = ' '.join(el.get('class', []))
-    has_marker = bool(el.get('data-cmtid')) or ('q2b7Oq' in classes)
+    classes_l  = classes.lower()
+    has_marker = bool(el.get('data-cmtid')) or any(
+        token in classes_l for token in ('q2b7oq', 'product-rating', 'review', 'rating')
+    )
     has_stars  = bool(
         el.select('svg.icon-rating-solid, svg[class*="icon-rating-solid"]')
         or el.select('svg.icon-rating, svg[class*="icon-rating"]')
@@ -190,7 +235,9 @@ def is_review_card(el) -> bool:
         or el.find(attrs={'aria-label': re.compile(r'[1-5]\s*(sao|star|out|/)', re.I)})
     )
     has_variant = 'Phân loại hàng' in text
-    return has_marker and (has_stars or has_variant)
+    has_comment_block = any(el.select(sel) for sel in COMMENT_SELECTORS)
+    has_date = len(date_hits) >= 1
+    return (has_marker or has_comment_block or has_date) and (has_stars or has_variant or has_comment_block)
 
 
 # ── Auto-detect selector ───────────────────────────────────────────────────────
@@ -232,6 +279,45 @@ def detect_selector(soup) -> str:
     fallback = 'div.q2b7Oq[data-cmtid], div.q2b7Oq'
     print(f'  [SELECTOR] fallback: {fallback}')
     return fallback
+
+
+def collect_product_links(driver, url_kind: str) -> list[str]:
+    """Cuộn trang và gom link sản phẩm nhiều vòng để giảm miss do lazy-load."""
+    product_links: list[str] = []
+    seen: set[str] = set()
+    max_rounds = 10 if url_kind == 'search' else 6
+    stagnant_rounds = 0
+    prev_count = -1
+
+    for _ in range(max_rounds):
+        html = driver.page_source
+        soup = BeautifulSoup(html, 'html.parser')
+
+        for a in soup.find_all('a', href=True):
+            full = normalize_product_url(a['href'])
+            if full and full not in seen:
+                seen.add(full)
+                product_links.append(full)
+
+        for m in re.finditer(r'(https://shopee\.vn[^\s"\']*(?:/product/\d+/\d+|-[iI]\.\d+\.\d+)[^\s"\']*)', html):
+            full = normalize_product_url(m.group(1))
+            if full and full not in seen:
+                seen.add(full)
+                product_links.append(full)
+
+        if len(product_links) == prev_count:
+            stagnant_rounds += 1
+        else:
+            stagnant_rounds = 0
+            prev_count = len(product_links)
+
+        if stagnant_rounds >= 2 and product_links:
+            break
+
+        driver.execute_script('window.scrollTo(0, document.body.scrollHeight);')
+        time.sleep(2 if url_kind == 'search' else 1.5)
+
+    return product_links
 
 
 # ── Scroll đến khu vực review ─────────────────────────────────────────────────
@@ -331,13 +417,7 @@ def parse_card(card, stars_js=None) -> dict | None:
         m = DATE_RE.search(full_text)
         date_str = m.group(0) if m else ''
 
-        review_date = None
-        if date_str:
-            try:
-                from datetime import datetime
-                review_date = datetime.strptime(date_str, '%Y-%m-%d %H:%M').date()
-            except ValueError:
-                pass
+        review_date = parse_review_date(date_str)
 
         vm = re.search(r'Phân loại hàng\s*:\s*([^|]+)', full_text)
         variant = ''
@@ -363,6 +443,7 @@ def parse_card(card, stars_js=None) -> dict | None:
 def scrape_product(driver, url: str) -> list[dict]:
     driver.get(url)
     time.sleep(3)
+    wait_if_verification_page(driver)
 
     scroll_to_review_section(driver)
 
@@ -430,7 +511,14 @@ def scrape_product(driver, url: str) -> list[dict]:
         for idx, card in enumerate(valid_cards):
             js_s = js_stars_list[idx] if idx < len(js_stars_list) else None
             rv   = parse_card(card, stars_js=js_s)
-            if rv is None or not rv.get('date'):
+            if rv is None:
+                continue
+            has_signal = (
+                rv.get('date') is not None
+                or int(rv.get('stars') or 0) > 0
+                or bool(rv.get('comment'))
+            )
+            if not has_signal:
                 continue
             reviews.append(rv)
 
@@ -456,34 +544,98 @@ def scrape_product(driver, url: str) -> list[dict]:
     return reviews
 
 
+# ── URL classification ─────────────────────────────────────────────────────────
+def _classify_url(url: str) -> str:
+    """Phân loại collection_url:
+       - 'product'   : trỏ thẳng đến 1 sản phẩm  (vd /product/xxx/yyy hoặc -i.xxx.yyy)
+       - 'search'    : trang search/mall-search  (cần scroll nhiều để lazy-load)
+       - 'collection': trang shop/collection bình thường (giữ logic cũ).
+    """
+    u = (url or '').lower()
+    if '/product/' in u or re.search(r'-i\.\d+\.\d+', u):
+        return 'product'
+    if ('entrypoint=shopbysearch' in u
+            or '/mall/search' in u
+            or '/search?' in u):
+        return 'search'
+    return 'collection'
+
+
+def _build_output_frames(image_id: str, brand: str, df: pd.DataFrame,
+                         raw_comment_str: str):
+    """Chuẩn hoá output cho main.py, kể cả khi banner có 0 review."""
+    total_review = len(df)
+    avg_stars = round(df['stars'].mean(), 2) if total_review > 0 else 0
+
+    banner_row = pd.DataFrame([{
+        'image_id'    : image_id,
+        'source'      : 'shopee',
+        'shop'        : brand,
+        'total_review': total_review,
+        'avg_stars'   : avg_stars,
+        'raw_comment' : raw_comment_str,
+    }])[['image_id', 'source', 'shop', 'total_review', 'avg_stars', 'raw_comment']]
+
+    if total_review == 0:
+        daily_rows = pd.DataFrame(columns=[
+            'date', 'total_day_review', 'avg_day_stars',
+            'total_5_stars', 'total_4_stars', 'total_3_stars',
+            'total_2_stars', 'total_1_stars',
+        ])
+    else:
+        daily_rows = (
+            df.dropna(subset=['date'])
+              .groupby(df['date'].dt.strftime('%Y-%m-%d'))
+              .agg(
+                  total_day_review=('stars', 'count'),
+                  avg_day_stars=('stars', lambda x: round(x.mean(), 2)),
+                  total_5_stars=('stars', lambda x: (x == 5).sum()),
+                  total_4_stars=('stars', lambda x: (x == 4).sum()),
+                  total_3_stars=('stars', lambda x: (x == 3).sum()),
+                  total_2_stars=('stars', lambda x: (x == 2).sum()),
+                  total_1_stars=('stars', lambda x: (x == 1).sum()),
+              )
+              .reset_index()
+              .rename(columns={'date': 'date'})
+        )[['date', 'total_day_review', 'avg_day_stars',
+           'total_5_stars', 'total_4_stars', 'total_3_stars',
+           'total_2_stars', 'total_1_stars']]
+
+    stats = {
+        'total_review': total_review,
+        'avg_stars'   : avg_stars,
+        'raw_comment' : raw_comment_str,
+    }
+    return banner_row, daily_rows, stats
+
+
 # ── Main extraction function ───────────────────────────────────────────────────
 def run_shopee_extraction(driver, camp: dict, image_id: str, data_dir: str):
-    brand = camp['brand']
+    brand    = camp['brand']
+    camp_url = camp['collection_url']
+    url_kind = _classify_url(camp_url)
 
-    driver.get(camp['collection_url'])
-    time.sleep(5)
-    for i in range(1, 4):
-        driver.execute_script(f'window.scrollTo(0, document.body.scrollHeight * {i/4});')
-        time.sleep(1.5)
+    # ── Nhánh A: URL là 1 sản phẩm → scrape trực tiếp, bỏ bước gom product_links
+    if url_kind == 'product':
+        print(f"  🎯 URL trỏ thẳng đến 1 sản phẩm → scrape trực tiếp")
+        product_links = [camp_url.split('?')[0]]
+    else:
+        # ── Nhánh B/C: trang shop / collection / search → gom link sản phẩm ──
+        driver.get(camp_url)
+        time.sleep(5)
+        wait_if_verification_page(driver)
+        product_links = collect_product_links(driver, url_kind)
 
-    soup = BeautifulSoup(driver.page_source, 'html.parser')
-    product_links = []
-    for a in soup.find_all('a', href=True):
-        href = a['href']
-        if '-i.' in href or '/product/' in href:
-            url = "https://shopee.vn" + href.split('?')[0]
-            if url not in product_links:
-                product_links.append(url)
-
-    print(f"  📦 Tìm thấy {len(product_links)} link sản phẩm cho [{brand}]")
+        print(f"  📦 Tìm thấy {len(product_links)} link sản phẩm "
+              f"cho [{brand}] (kind={url_kind})")
 
     all_reviews         = []
     banner_raw_comments = []
     qualified_count     = 0
     scanned             = 0
-    product_results     = []   # lưu lại để dùng cho fallback
+    product_results     = []   # lưu lại metadata để dùng cho fallback
 
-    # ── PASS 1: Lấy SP có >= MIN_COMMENTS comment hợp lệ ─────────────────
+    # ── PASS 1: Lấy SP có >= MIN_REVIEWS review hợp lệ ───────────────────
     for link in product_links:
         if qualified_count >= MAX_PRODUCTS:
             break
@@ -491,10 +643,17 @@ def run_shopee_extraction(driver, camp: dict, image_id: str, data_dir: str):
         print(f"  -> SP {scanned}/{len(product_links)} | đạt={qualified_count}/{MAX_PRODUCTS}...", end='\r')
 
         rv = scrape_product(driver, link)
-        product_results.append(rv)
-
         valid_cmts = [r['comment'] for r in rv if r.get('comment')]
-        if len(valid_cmts) >= MIN_COMMENTS:
+        review_count = len(rv)
+        is_qualified = (review_count >= MIN_REVIEWS) or (len(valid_cmts) >= MIN_COMMENTS)
+        product_results.append({
+            'reviews': rv,
+            'review_count': review_count,
+            'comment_count': len(valid_cmts),
+            'qualified': is_qualified,
+        })
+
+        if is_qualified:
             qualified_count += 1
             all_reviews.extend(rv)
             banner_raw_comments.extend(valid_cmts[:MAX_COMMENTS_EACH])
@@ -505,14 +664,20 @@ def run_shopee_extraction(driver, camp: dict, image_id: str, data_dir: str):
 
     # ── PASS 2 (fallback): Nếu chưa đủ MAX_PRODUCTS ──────────────────────
     if qualified_count < MAX_PRODUCTS:
-        print(f"  ⚠️  Chỉ có {qualified_count} SP đạt ≥{MIN_COMMENTS} comment. Chạy fallback...")
+        print(f"  ⚠️  Chỉ có {qualified_count} SP đạt ≥{MIN_REVIEWS} review. Chạy fallback...")
         added = 0
-        # Tận dụng kết quả đã quét nhưng bị loại
-        for rv in product_results:
+        # Tận dụng kết quả đã quét nhưng bị loại, ưu tiên SP có nhiều review hơn
+        fallback_results = sorted(
+            [p for p in product_results if (not p['qualified']) and p['reviews']],
+            key=lambda p: (p['review_count'], p['comment_count']),
+            reverse=True,
+        )
+        for product in fallback_results:
             if qualified_count + added >= MAX_PRODUCTS:
                 break
+            rv = product['reviews']
             valid_cmts = [r['comment'] for r in rv if r.get('comment')]
-            if len(valid_cmts) < MIN_COMMENTS and rv:
+            if rv:
                 all_reviews.extend(rv)
                 banner_raw_comments.extend(valid_cmts[:MAX_COMMENTS_EACH])
                 added += 1
@@ -531,49 +696,25 @@ def run_shopee_extraction(driver, camp: dict, image_id: str, data_dir: str):
                 added += 1
             time.sleep(1.5)
         print()
-        print(f"  📊 Fallback: {qualified_count} đạt chuẩn + {added} fallback = {qualified_count+added} SP")
+        print(f"  📊 Fallback: {qualified_count} đạt chuẩn + {added} fallback = {qualified_count + added} SP")
     else:
         print(f"  📊 Đủ {qualified_count}/{MAX_PRODUCTS} SP đạt chuẩn.")
 
     if not all_reviews:
         print(f"⚠️  Không lấy được review nào cho: {brand}")
-        return
+        empty_df = pd.DataFrame(columns=['date', 'stars', 'variant', 'comment'])
+        return _build_output_frames(image_id, brand, empty_df, '')
 
     df = pd.DataFrame(all_reviews)
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
 
     raw_comment_str = ' | '.join(banner_raw_comments)
 
-    # ── banner_summary.csv: image_id, source, shop, total_review, avg_stars, raw_comment
-    banner_row = pd.DataFrame([{
-        'image_id'    : image_id,
-        'source'      : 'shopee',
-        'shop'        : brand,
-        'total_review': len(df),
-        'avg_stars'   : round(df['stars'].mean(), 2) if len(df) > 0 else 0,
-        'raw_comment' : raw_comment_str,
-    }])[['image_id', 'source', 'shop', 'total_review', 'avg_stars', 'raw_comment']]
-
-    # ── daily_summary.csv: date, total_day_review, avg_day_stars, total_N_stars
-    daily_rows = (
-        df.dropna(subset=['date'])
-          .groupby(df['date'].dt.strftime('%Y-%m-%d'))
-          .agg(
-              total_day_review = ('stars', 'count'),
-              avg_day_stars    = ('stars', lambda x: round(x.mean(), 2)),
-              total_5_stars    = ('stars', lambda x: (x == 5).sum()),
-              total_4_stars    = ('stars', lambda x: (x == 4).sum()),
-              total_3_stars    = ('stars', lambda x: (x == 3).sum()),
-              total_2_stars    = ('stars', lambda x: (x == 2).sum()),
-              total_1_stars    = ('stars', lambda x: (x == 1).sum()),
-          )
-          .reset_index()
-          .rename(columns={'date': 'date'})
-    )[['date', 'total_day_review', 'avg_day_stars',
-       'total_5_stars', 'total_4_stars', 'total_3_stars',
-       'total_2_stars', 'total_1_stars']]
+    banner_row, daily_rows, stats = _build_output_frames(
+        image_id, brand, df, raw_comment_str
+    )
 
     print(f"✅ [{brand}] ({image_id}) scraped | Reviews: {len(df)} | SP quét: {scanned} | SP ≥{MIN_COMMENTS} cmt: {qualified_count}")
 
-    # Trả về 2 dataframe để main.py gom batch rồi ghi CSV
-    return banner_row, daily_rows
+    # Trả về dataframe + stats để main.py ghi JSON và gom batch CSV
+    return banner_row, daily_rows, stats
