@@ -34,7 +34,8 @@ Aesthetic-Pressure-ML/
 │   ├── features/               # Module xử lý ảnh OpenCV (GĐ 2)
 │   │   ├── edge_processor.py   # (Vân Anh)
 │   │   ├── color_processor.py  # (Linh Khánh)
-│   │   └── text_processor.py   # (Hà Ngọc)
+│   │   ├── text_processor.py   # (Hà Ngọc)
+│   │   └── compute_ap_scores.py # Tính AP thô + MinMax từ tương tác đa nguồn
 │   ├── sentiment/              # Module xử lý NLP (GĐ 3)
 │   │   ├── score_logic.py      # Tính AP Score (Vân Anh)
 │   │   └── nlp_engine.py       # Phân tích cảm xúc (Linh Khánh)
@@ -74,11 +75,63 @@ git clone https://github.com/[username]/Aesthetic-Pressure-ML.git
 pip install -r requirements.txt
 ```
 
+## 🧮 AP Scoring (Interaction Normalization)
+Pipeline AP mới dùng 3 nguồn tương tác:
+
+- Facebook: `total_react` + `share_count`
+- Instagram: `total_react`
+- Shopee: `avg_stars` + `total_review` (quy doi ra stars equivalent)
+
+### Công thức áp lực thô (source-aware, chống nhiễu do thiếu cột)
+```text
+stars_equivalent = total_review * (avg_stars / 5)
+
+AP_positive = (
+  w_r  * log1p(reactions)
+  + w_s  * log1p(share)
+  + w_t  * log1p(stars_equivalent)
+) / sum(active_weights)
+
+AP_negative = (
+  w_a * log1p(react_angry)
+) / sum(active_neg_weights)
+
+AP_raw = AP_positive - AP_negative
+```
+
+Trong đó:
+- `AP_positive`: chỉ tính các metric thực sự tồn tại (cột có dữ liệu) và chia theo tổng trọng số active.
+  - Facebook: reactions + share
+  - Instagram: reactions
+  - Shopee: stars_equivalent
+- `AP_negative`: với Facebook dùng `react_angry` làm thành phần phạt.
+
+Như vậy, metric không tồn tại (do nguồn không cung cấp) sẽ giữ NA và không bị coi là `0`, tránh nhiễu dữ liệu liên nguồn.
+
+Biến tăng cường cảm xúc:
+```text
+ap_sentiment_adjusted = diem_ap_luc_tho * (1 - angry_ratio)
+angry_ratio = react_angry / reactions
+```
+Biến này phạt mạnh hơn các bài có tỷ lệ phản ứng tiêu cực cao.
+
+Sau đó chuẩn hóa về [0,1] bằng `MinMaxScaler`:
+- Cột thô: `diem_ap_luc_tho`
+- Cột chuẩn hóa: `diem_ap_luc_chuan_hoa`
+
+### Chạy script
+```bash
+python src/features/compute_ap_scores.py
+```
+
+Output mặc định:
+`data/processed/interaction_ap_scores.csv`
+
 ## 📊 Quản lý dự án
 link notion quản lý dự án: [AESTHETIC PRESSURE](https://www.notion.so/AESTHETIC-PRESSURE-337001c683f180769b8efc89ef4d5f0f?source=copy_link)
-* [x] GĐ 1: Thu thập dữ liệu (In Progress)
-* [ ] GĐ 2: Trích xuất đặc trưng (Pending)
-* [ ] GĐ 3: NLP & Merging (Pending)
+* [x] GĐ 1: Thu thập dữ liệu (Done)
+* [x] GĐ 2: Trích xuất đặc trưng (Done)
+* [x] GĐ 3: NLP & Merging (In Progress)
 * [ ] GĐ 4: Huấn luyện Model (Pending)
 * [ ] GĐ 5: Tiểu luận & Demo (Pending)
 
